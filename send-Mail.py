@@ -12,8 +12,7 @@ import paho.mqtt.client as mqtt
 import os
 import openpyxl
 from openpyxl import Workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
-import pandas as pd
+import traceback
 
 # === Configuration ===
 MQTT_BROKER = "192.168.2.133"
@@ -27,17 +26,21 @@ SMTP_PORT = 587
 DATA_DIR = "data"
 REPORT_CSV = "daily_report.csv"
 
-REPORT_TIME_HHMM = "16:19"  # Use HH:MM format
+REPORT_TIME_HHMM = "17:31"  # Use HH:MM format
 MISSING_TIMEOUT = 30
 THREAD_MESSAGE_ID = "<zaroli-monitor-thread@a1fenceproducts.com>"
 
-# 🔧 Set to False to disable per-sensor online/offline notifications
+# Set to False to disable per-sensor online/offline notifications
 SENSOR_LEVEL_NOTIFICATION = True
 LEARNING_PERIOD = 60  # seconds to learn expected sensors
-# 🔧 Set the expected number of sensors to automatically end learning phase
+# Set the expected number of sensors to automatically end learning phase
 EXPECTED_SENSOR_COUNT = 34
-# 🔧 seconds to wait before sending batched sensor status notifications
+# seconds to wait before sending batched sensor status notifications
 BATCH_NOTIFICATION_DELAY = 30
+
+# === Global Locks ===
+excel_lock = threading.Lock()  # For Excel file operations
+buffer_lock = threading.Lock()  # For sensor_data_buffer access
 
 # === State Variables ===
 last_msg_time = time.time()
@@ -61,7 +64,6 @@ sensor_activity = {}
 # Batched notification system
 pending_notifications = []  # List of status changes to be sent in batch
 last_batch_notification_time = time.time()
-BATCH_NOTIFICATION_DELAY = 30  # seconds to wait before sending batch notification
 
 # Excel workbook and worksheets for daily logging
 daily_workbooks = {}  # date_str: workbook_path
@@ -82,8 +84,9 @@ def initialize_sensor(mac):
         "last_update": current_time
     }
     # Initialize data buffer for this sensor
-    if mac not in sensor_data_buffer:
-        sensor_data_buffer[mac] = []
+    with buffer_lock:
+        if mac not in sensor_data_buffer:
+            sensor_data_buffer[mac] = []
 
 
 def finalize_expected_sensors(reason="timeout"):
@@ -114,7 +117,6 @@ def finalize_expected_sensors(reason="timeout"):
             f"Please check if sensors are transmitting data."
         )
         send_email(body, subject="Zaroli MQTT Monitor - No Sensors Discovered")
-    # If reason is "count_met", don't send any email
 
 
 # Ensure data directory exists
@@ -183,7 +185,7 @@ def convert_to_excel_compatible(value):
 
 
 def save_to_excel(data_dict):
-    """Save sensor data to Excel file with separate sheets per sensor"""
+    """Save sensor data to buffer with thread-safe access"""
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -192,112 +194,97 @@ def save_to_excel(data_dict):
     if not mac:
         return
 
-    # Initialize sensor data buffer if not exists
-    if mac not in sensor_data_buffer:
-        sensor_data_buffer[mac] = []
-
-    # Convert all values to Excel-compatible format
+    # Convert values to Excel-compatible format
     excel_compatible_data = {}
     for key, value in data_dict.items():
         excel_compatible_data[key] = convert_to_excel_compatible(value)
 
-    # Add timestamp and store data in buffer
-    row_data = {"timestamp": timestamp, **excel_compatible_data}
-    sensor_data_buffer[mac].append(row_data)
-
-    # Write to Excel file every 10 records or every 5 minutes (whichever comes first)
-    if len(sensor_data_buffer[mac]) >= 10 or should_flush_buffer(mac):
-        flush_sensor_data_to_excel(mac, date_str)
-
-
-def should_flush_buffer(mac):
-    """Check if buffer should be flushed based on time"""
-    if not sensor_data_buffer[mac]:
-        return False
-
-    # Get timestamp of oldest record in buffer
-    oldest_record = sensor_data_buffer[mac][0]
-    oldest_time = datetime.strptime(
-        oldest_record["timestamp"], "%Y-%m-%d %H:%M:%S")
-
-    # Flush if oldest record is more than 5 minutes old
-    return (datetime.now() - oldest_time).total_seconds() > 300
+    # Add to buffer with locking
+    with buffer_lock:
+        if mac not in sensor_data_buffer:
+            sensor_data_buffer[mac] = []
+        sensor_data_buffer[mac].append(
+            {"timestamp": timestamp, **excel_compatible_data})
 
 
 def flush_sensor_data_to_excel(mac, date_str):
-    """Flush sensor data buffer to Excel file"""
-    if not sensor_data_buffer[mac]:
-        return
+    """Flush sensor data to Excel file with thread-safe operations"""
+    # Get records to write and clear buffer
+    with buffer_lock:
+        if not sensor_data_buffer.get(mac):
+            return
+        records_to_write = sensor_data_buffer[mac]
+        sensor_data_buffer[mac] = []  # Clear buffer
 
     file_path = os.path.join(DATA_DIR, f"mqtt_data_{date_str}.xlsx")
 
     try:
-        # Load existing workbook or create new one
-        if os.path.exists(file_path):
-            workbook = openpyxl.load_workbook(file_path)
-        else:
-            workbook = Workbook()
-            # Remove default sheet
-            if 'Sheet' in workbook.sheetnames:
-                workbook.remove(workbook['Sheet'])
+        with excel_lock:
+            # Handle existing file
+            if os.path.exists(file_path):
+                try:
+                    # Check for zero-byte file
+                    if os.path.getsize(file_path) == 0:
+                        raise Exception("Zero-byte file")
+                    workbook = openpyxl.load_workbook(file_path)
+                except Exception as e:
+                    print(
+                        f"⚠️ Regenerating corrupted workbook {file_path}: {e}")
+                    workbook = Workbook()
+                    if 'Sheet' in workbook.sheetnames:
+                        workbook.remove(workbook['Sheet'])
+            else:
+                workbook = Workbook()
+                if 'Sheet' in workbook.sheetnames:
+                    workbook.remove(workbook['Sheet'])
 
-        # Create or get worksheet for this sensor
-        # Replace colons for valid sheet name
-        sheet_name = f"Sensor_{mac.replace(':', '_')}"
-        # Limit sheet name to 31 characters (Excel limit)
-        if len(sheet_name) > 31:
-            sheet_name = sheet_name[:31]
+            # Prepare sheet name
+            sheet_name = f"Sensor_{mac.replace(':', '_')}"[:31]
 
-        if sheet_name in workbook.sheetnames:
-            worksheet = workbook[sheet_name]
-            start_row = worksheet.max_row + 1
-        else:
-            worksheet = workbook.create_sheet(sheet_name)
-            # Add headers
-            if sensor_data_buffer[mac]:
-                headers = list(sensor_data_buffer[mac][0].keys())
-                worksheet.append(headers)
-            start_row = 2
+            # Get or create worksheet
+            if sheet_name in workbook.sheetnames:
+                worksheet = workbook[sheet_name]
+                start_row = worksheet.max_row + 1
+            else:
+                worksheet = workbook.create_sheet(sheet_name)
+                headers = list(
+                    records_to_write[0].keys()) if records_to_write else []
+                if headers:
+                    worksheet.append(headers)
+                start_row = 2
 
-        # Add buffered data to worksheet
-        records_added = 0
-        for row_data in sensor_data_buffer[mac]:
-            try:
-                # Convert all values to ensure Excel compatibility
-                excel_row = []
-                for value in row_data.values():
-                    excel_row.append(convert_to_excel_compatible(value))
-                worksheet.append(excel_row)
-                records_added += 1
-            except Exception as row_error:
-                print(f"⚠️ Error adding row for sensor {mac}: {row_error}")
-                print(f"   Problematic data: {row_data}")
-                continue
+            # Write records
+            records_added = 0
+            for row_data in records_to_write:
+                try:
+                    row_values = [convert_to_excel_compatible(
+                        v) for v in row_data.values()]
+                    worksheet.append(row_values)
+                    records_added += 1
+                except Exception as e:
+                    print(f"⚠️ Error writing row for {mac}: {e}")
 
-        # Save workbook
-        workbook.save(file_path)
-
-        # Clear buffer for this sensor
-        buffer_size = len(sensor_data_buffer[mac])
-        sensor_data_buffer[mac] = []
-
-        print(
-            f"📊 Flushed {records_added}/{buffer_size} records for sensor {mac} to {file_path}")
+            # Save workbook
+            workbook.save(file_path)
+            print(f"📊 Saved {records_added} records for {mac} to {file_path}")
 
     except Exception as e:
-        print(f"❌ Error saving to Excel for sensor {mac}: {e}")
-        print(f"   File: {file_path}")
-        # Don't clear buffer if save failed, so we can retry later
-        if "Cannot convert" in str(e):
-            print(
-                f"   Sample data causing error: {sensor_data_buffer[mac][:1] if sensor_data_buffer[mac] else 'No data'}")
+        print(f"❌ Critical error saving {mac} data: {e}")
+        # Requeue records on failure
+        with buffer_lock:
+            sensor_data_buffer[mac] = records_to_write + \
+                sensor_data_buffer[mac]
+        print("♻️ Records requeued for retry")
 
 
 def flush_all_sensor_buffers():
     """Flush all sensor data buffers to Excel files"""
     date_str = datetime.now().strftime("%Y-%m-%d")
-    for mac in list(sensor_data_buffer.keys()):
-        if sensor_data_buffer[mac]:  # Only flush if there's data
+    with buffer_lock:
+        macs_to_process = list(sensor_data_buffer.keys())
+
+    for mac in macs_to_process:
+        if sensor_data_buffer.get(mac):  # Only flush if there's data
             flush_sensor_data_to_excel(mac, date_str)
 
 
